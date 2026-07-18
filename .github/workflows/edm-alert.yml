@@ -2,8 +2,8 @@ name: EDM Cabo Delgado outage alert
 
 on:
   schedule:
-    # Every 4 hours (UTC). Mozambique is UTC+2.
-    - cron: "0 */4 * * *"
+    # Every 12 hours (UTC). Mozambique is UTC+2.
+    - cron: "0 */12 * * *"
   workflow_dispatch: {}   # lets you run it manually from the Actions tab
 
 permissions:
@@ -24,6 +24,7 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           ALERT_TO: ${{ secrets.ALERT_TO }}
+          PROVINCE: "Gaza"   # TEMPORARY - change back to "Cabo Delgado" after testing
         run: python check_edm.py
 
       - name: Save alerted outage IDs
