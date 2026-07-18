@@ -1,9 +1,10 @@
 """
-EDM outage alert for Cabo Delgado.
+EDM outage alert.
 
 Scrapes https://www.edm.co.mz/manutencao, finds scheduled cuts
 ("Corte Programado") whose province matches PROVINCE, and emails
-you about any outage reference code it hasn't alerted on before.
+you about any outage reference code it hasn't alerted on before,
+formatted in Portuguese similar to the site's own cards.
 
 State (already-alerted codes) is kept in seen_ids.json, which the
 GitHub Actions workflow commits back to the repo.
@@ -31,9 +32,44 @@ URL = "https://www.edm.co.mz/manutencao"
 PROVINCE = os.environ.get("PROVINCE", "Cabo Delgado")
 STATE_FILE = Path(__file__).parent / "seen_ids.json"
 
-# Outage reference codes look like PEM260705-0092
-CODE_RE = re.compile(r"\b([A-Z]{3}\d{6}-\d{4})\b")
 TAG_RE = re.compile(r"<[^>]+>")
+
+WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+MONTHS = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+
+WEEKDAY_PT = {
+    "Sunday": "Domingo", "Monday": "Segunda-feira", "Tuesday": "Terça-feira",
+    "Wednesday": "Quarta-feira", "Thursday": "Quinta-feira", "Friday": "Sexta-feira",
+    "Saturday": "Sábado",
+}
+MONTH_PT = {
+    "January": "Janeiro", "February": "Fevereiro", "March": "Março", "April": "Abril",
+    "May": "Maio", "June": "Junho", "July": "Julho", "August": "Agosto",
+    "September": "Setembro", "October": "Outubro", "November": "Novembro", "December": "Dezembro",
+}
+
+# Matches one full outage card in the order the site renders it:
+# Weekday / day / Month Year / start / end / "Corte Programado" / CODE /
+# Province / "ASC <office>" / "Bairros / Zonas Afectadas:" / affected areas
+RECORD_RE = re.compile(
+    r"(?P<weekday>" + "|".join(WEEKDAYS) + r")\s+"
+    r"(?P<day>\d{1,2})\s+"
+    r"(?P<month>" + "|".join(MONTHS) + r")\s+"
+    r"(?P<year>\d{4})\s+"
+    r"(?P<start>\d{1,2}:\d{2})\s+"
+    r"(?P<end>\d{1,2}:\d{2})\s+"
+    r"Corte Programado\s+"
+    r"(?P<code>[A-Z]{3}\d{6}-\d{4})\s+"
+    r"(?P<province>.+?)\s+"
+    r"(?P<asc>ASC\s+\S+(?:[\s-]\S+)*?)\s+"
+    r"Bairros\s*/\s*Zonas Afectadas:\s*"
+    r"(?P<affected>.+?)"
+    r"(?=(?:" + "|".join(WEEKDAYS) + r")|Adic\.\s*Alerta|$)",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def fetch_page_text() -> str:
@@ -42,24 +78,29 @@ def fetch_page_text() -> str:
     )
     with urllib.request.urlopen(req, timeout=60) as resp:
         raw = resp.read().decode("utf-8", errors="replace")
-    # Strip tags, unescape entities, collapse whitespace
     text = TAG_RE.sub(" ", raw)
     text = html.unescape(text)
     return re.sub(r"\s+", " ", text)
 
 
 def extract_outages(text: str) -> list[dict]:
-    """Split page text into blocks around each reference code."""
     outages = []
-    matches = list(CODE_RE.finditer(text))
-    for i, m in enumerate(matches):
-        code = m.group(1)
-        # Province and affected areas appear AFTER the code on this page.
-        # Only look at text between this code and the next one, so stray
-        # mentions (e.g. the province filter dropdown) can't false-match.
-        end = matches[i + 1].start() if i + 1 < len(matches) else m.end() + 600
-        block = text[m.start():end]
-        outages.append({"code": code, "block": block.strip()})
+    for m in RECORD_RE.finditer(text):
+        d = m.groupdict()
+        outages.append(
+            {
+                "code": d["code"],
+                "province": d["province"].strip(),
+                "asc": re.sub(r"\s+", " ", d["asc"]).strip(),
+                "weekday": d["weekday"],
+                "day": d["day"],
+                "month": d["month"],
+                "year": d["year"],
+                "start": d["start"],
+                "end": d["end"],
+                "affected": d["affected"].strip().rstrip("."),
+            }
+        )
     return outages
 
 
@@ -73,23 +114,40 @@ def save_seen(seen: set) -> None:
     STATE_FILE.write_text(json.dumps(sorted(seen), indent=2))
 
 
+def format_time(t: str) -> str:
+    h, m = t.split(":")
+    return f"{int(h):02d}:{m}"
+
+
+def format_outage_pt(o: dict) -> str:
+    weekday_pt = WEEKDAY_PT.get(o["weekday"], o["weekday"])
+    month_pt = MONTH_PT.get(o["month"], o["month"])
+    return (
+        f"CORTE DE ENERGIA — {o['province'].upper()}\n"
+        f"{'-' * 40}\n"
+        f"DATA DE CORTE: {o['day']} {month_pt.upper()} {o['year']}\n"
+        f"DIA DA SEMANA DE CORTE: {weekday_pt.upper()}\n"
+        f"INTERVALO DE CORTE: {format_time(o['start'])} - {format_time(o['end'])}\n"
+        f"AGÊNCIA: {o['asc']}\n"
+        f"CÓDIGO DE REFERÊNCIA: {o['code']}\n\n"
+        f"ZONAS AFECTADAS:\n{o['affected']}."
+    )
+
+
 def send_email(new_outages: list[dict]) -> None:
     user = os.environ["SMTP_USER"]
     password = os.environ["SMTP_PASS"]
     to_addr = os.environ["ALERT_TO"]
 
-    lines = [f"New scheduled power cut(s) announced for {PROVINCE}:\n"]
-    for o in new_outages:
-        lines.append(f"Reference: {o['code']}")
-        lines.append(f"Details: {o['block']}")
-        lines.append("-" * 60)
-    lines.append(f"\nSource: {URL}")
+    body_blocks = [format_outage_pt(o) for o in new_outages]
+    body = f"\n\n{'=' * 40}\n\n".join(body_blocks)
+    body += f"\n\nFonte: {URL}"
 
     msg = EmailMessage()
-    msg["Subject"] = f"⚡ EDM: {len(new_outages)} power cut(s) scheduled — {PROVINCE}"
+    msg["Subject"] = f"Corte de Energia: {PROVINCE}"
     msg["From"] = user
     msg["To"] = to_addr
-    msg.set_content("\n".join(lines))
+    msg.set_content(body)
 
     ctx = ssl.create_default_context()
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as server:
@@ -100,7 +158,7 @@ def send_email(new_outages: list[dict]) -> None:
 def main() -> int:
     text = fetch_page_text()
     outages = extract_outages(text)
-    matching = [o for o in outages if PROVINCE.lower() in o["block"].lower()]
+    matching = [o for o in outages if PROVINCE.lower() in o["province"].lower()]
 
     seen = load_seen()
     new = [o for o in matching if o["code"] not in seen]
