@@ -24,7 +24,7 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           ALERT_TO: ${{ secrets.ALERT_TO }}
-          PROVINCE: "Gaza"   # TEMPORARY - change back to "Cabo Delgado" after testing
+          PROVINCE: "Cabo Delgado"  
         run: python check_edm.py
 
       - name: Save alerted outage IDs
